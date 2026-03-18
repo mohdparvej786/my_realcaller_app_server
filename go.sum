@@ -1,8 +1,0 @@
-github.com/BurntSushi/toml v0.4.1 h1:5oUGk0ZgVHg6oGJThK1kUOkiYgNLPz8rEsTILP+zslc=
-github.com/BurntSushi/toml v0.4.1/go.mod h1:4xfJbXHFVf0w5w+YkR/LlF9xjD6rCj2/++2gTepNQ8E=
-github.com/gin-gonic/gin v1.9.0 h1:kfQp4O0VpuX+nUL3/+Tzp1r6K3z+OAc+uZk6uO0v6kA=
-github.com/gin-gonic/gin v1.9.0/go.mod h1:ZQ2n/k/lfGAG6kOxw0odV3kL19rhKhIGc4bbmkkL0aY=
-github.com/go-redis/redis/v8 v8.12.2 h1:1k6lT7I0pX3O3H6kS5Gx9fO0y2RRc0DNWezPRLkE8iI=
-github.com/go-redis/redis/v8 v8.12.2/go.mod h1:7I6s6PclG6SzD/J96D/m0yRjge2Cw4jqlC1fGhlA0GQ=
-github.com/jackc/pgx/v5 v5.10.0 h1:W6vbbH2v0wzMv0wyz9WQpIZCX+5bUg8rKqkgn49l/X0=
-github.com/jackc/pgx/v5 v5.10.0/go.mod h1:IMi6hG3HUru4cVf0gAvrFVWm5g6tW+N3cOMgT8G6Rm4=
