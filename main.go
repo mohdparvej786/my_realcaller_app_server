@@ -1,408 +1,415 @@
 package main
 
 import (
-    "context"
-    "database/sql"
-    "encoding/json"
-    "fmt"
-    "log"
-    "os"
-    "strings"
-    "sync"
-    "sync/atomic"
-    "time"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"log"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
-    "github.com/gin-gonic/gin"
-    "github.com/go-redis/redis/v8"
-    _ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 var db *sql.DB
 var rdb *redis.Client
 var workerPool = make(chan struct{}, 100)
-var ctx = context.Background() // Redis context
+var ctx = context.Background()
 
 // ================= STRUCT =================
 type Contact struct {
-    Names       map[string]int `json:"names"`
-    SpamReports int            `json:"spam_reports"`
-    IsBusiness  bool           `json:"is_business"`
+	Names       map[string]int `json:"names"`
+	SpamReports int            `json:"spam_reports"`
+	IsBusiness  bool           `json:"is_business"`
+}
+
+type ContactInput struct {
+	Name   string `json:"name"`
+	Number string `json:"number"`
 }
 
 // ================= INIT =================
 func initDB() {
-    // Postgres init
-    connStr := os.Getenv("DATABASE_URL") // Render internal Postgres URL
-    var err error
-    db, err = sql.Open("pgx", connStr)
-    if err != nil {
-        log.Fatal(err)
-    }
+	connStr := os.Getenv("DATABASE_URL") // Render internal DB URL
 
-    if err := db.Ping(); err != nil {
-        log.Fatal("DB not connected:", err)
-    }
-    log.Println("✅ Database connected")
+	var err error
+	db, err = sql.Open("pgx", connStr)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-    // Create table if not exists
-    db.Exec(`
-    CREATE TABLE IF NOT EXISTS contacts (
-        number TEXT PRIMARY KEY,
-        names JSONB,
-        spam_reports INT DEFAULT 0,
-        is_business BOOLEAN DEFAULT FALSE,
-        updated_at TIMESTAMP DEFAULT NOW()
-    );`)
+	if err := db.Ping(); err != nil {
+		log.Fatal("DB not connected:", err)
+	}
 
-    // Redis init
-    redisURL := os.Getenv("REDIS_URL") // Upstash URL
-    if redisURL != "" {
-        opt, err := redis.ParseURL(redisURL)
-        if err != nil {
-            log.Println("Redis parse error:", err)
-        } else {
-            rdb = redis.NewClient(opt)
-            if err := rdb.Ping(ctx).Err(); err != nil {
-                log.Println("Redis not connected:", err)
-                rdb = nil // Fail gracefully
-            } else {
-                log.Println("✅ Redis connected")
-            }
-        }
-    } else {
-        log.Println("Redis URL not set, skipping Redis")
-    }
+	// Create table if not exists
+	db.Exec(`
+	CREATE TABLE IF NOT EXISTS contacts (
+		number TEXT PRIMARY KEY,
+		names JSONB,
+		spam_reports INT DEFAULT 0,
+		is_business BOOLEAN DEFAULT FALSE,
+		updated_at TIMESTAMP DEFAULT NOW()
+	);`)
+}
+
+// ================= REDIS =================
+func initRedis() {
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		log.Println("⚠️ REDIS_URL not set, caching disabled")
+		return
+	}
+
+	opt, err := redis.ParseURL(redisURL)
+	if err != nil {
+		log.Println("⚠️ REDIS PARSE ERROR:", err)
+		return
+	}
+
+	rdb = redis.NewClient(opt)
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Println("⚠️ Redis not connected:", err)
+		rdb = nil // disable caching
+		return
+	}
+
+	log.Println("✅ Redis connected")
 }
 
 // ================= HELPERS =================
 func normalizeNumber(number string) string {
-    digits := ""
-    for _, c := range number {
-        if c >= '0' && c <= '9' {
-            digits += string(c)
-        }
-    }
-    if len(digits) >= 10 {
-        return digits[len(digits)-10:]
-    }
-    return digits
+	digits := ""
+	for _, c := range number {
+		if c >= '0' && c <= '9' {
+			digits += string(c)
+		}
+	}
+	if len(digits) >= 10 {
+		return digits[len(digits)-10:]
+	}
+	return digits
 }
 
 func isBusinessName(name string) bool {
-    keywords := []string{"shop", "store", "clinic", "hospital", "bank", "service", "pvt", "ltd"}
-    name = strings.ToLower(name)
-    for _, k := range keywords {
-        if strings.Contains(name, k) {
-            return true
-        }
-    }
-    return false
+	keywords := []string{"shop", "store", "clinic", "hospital", "bank", "service", "pvt", "ltd"}
+	name = strings.ToLower(name)
+	for _, k := range keywords {
+		if strings.Contains(name, k) {
+			return true
+		}
+	}
+	return false
 }
 
 // ================= CACHE =================
 func getFromCache(number string) (Contact, bool) {
-    if rdb == nil {
-        return Contact{}, false
-    }
-    val, err := rdb.Get(ctx, "c:"+number).Result()
-    if err != nil {
-        return Contact{}, false
-    }
-    var data Contact
-    json.Unmarshal([]byte(val), &data)
-    return data, true
+	if rdb == nil {
+		return Contact{}, false
+	}
+	val, err := rdb.Get(ctx, "c:"+number).Result()
+	if err != nil {
+		return Contact{}, false
+	}
+	var data Contact
+	json.Unmarshal([]byte(val), &data)
+	return data, true
 }
 
 func setCache(number string, data Contact) {
-    if rdb == nil {
-        return
-    }
-    j, _ := json.Marshal(data)
-    rdb.Set(ctx, "c:"+number, j, 10*time.Minute)
+	if rdb == nil {
+		return
+	}
+	j, _ := json.Marshal(data)
+	rdb.Set(ctx, "c:"+number, j, 10*time.Minute)
 }
 
 // ================= DB =================
 func getFromDB(number string) (Contact, bool) {
-    ctxDB, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-    defer cancel()
+	ctxDB, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 
-    row := db.QueryRowContext(ctxDB,
-        "SELECT names, spam_reports, is_business FROM contacts WHERE number=$1", number)
+	row := db.QueryRowContext(ctxDB,
+		"SELECT names, spam_reports, is_business FROM contacts WHERE number=$1", number)
 
-    var namesJSON []byte
-    var spam int
-    var isBiz bool
+	var namesJSON []byte
+	var spam int
+	var isBiz bool
 
-    err := row.Scan(&namesJSON, &spam, &isBiz)
-    if err != nil {
-        return Contact{}, false
-    }
+	err := row.Scan(&namesJSON, &spam, &isBiz)
+	if err != nil {
+		return Contact{}, false
+	}
 
-    names := make(map[string]int)
-    json.Unmarshal(namesJSON, &names)
+	names := make(map[string]int)
+	json.Unmarshal(namesJSON, &names)
 
-    return Contact{names, spam, isBiz}, true
+	return Contact{names, spam, isBiz}, true
 }
 
 // ================= UPSERT =================
 func upsertContact(name, num string, isBiz bool) error {
-    ctxDB, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-    defer cancel()
+	ctxDB, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 
-    _, err := db.ExecContext(ctxDB, `
-    INSERT INTO contacts (number, names, is_business)
-    VALUES ($1, jsonb_build_object($2::text, 1), $3)
-    ON CONFLICT (number)
-    DO UPDATE SET 
-        names = contacts.names || jsonb_build_object($2::text, COALESCE((contacts.names ->> $2)::int, 0) + 1),
-        is_business = contacts.is_business OR $3,
-        updated_at = NOW()
-    `, num, name, isBiz)
+	_, err := db.ExecContext(ctxDB, `
+	INSERT INTO contacts (number, names, is_business)
+	VALUES ($1, jsonb_build_object($2::text, 1), $3)
+	ON CONFLICT (number)
+	DO UPDATE SET 
+	names = contacts.names || 
+	        jsonb_build_object(
+	            $2::text, 
+	            COALESCE((contacts.names ->> $2)::int, 0) + 1
+	        ),
+	is_business = contacts.is_business OR $3,
+	updated_at = NOW()
+	`, num, name, isBiz)
 
-    return err
+	return err
 }
 
 // ================= RESPONSE =================
 func buildResponse(num string, data Contact) gin.H {
-    top := "Unknown"
-    max := 0
-    total := 0
+	top := "Unknown"
+	max := 0
+	total := 0
 
-    for n, c := range data.Names {
-        total += c
-        if c > max {
-            max = c
-            top = n
-        }
-    }
+	for n, c := range data.Names {
+		total += c
+		if c > max {
+			max = c
+			top = n
+		}
+	}
 
-    isSpam := data.SpamReports > 5
+	isSpam := data.SpamReports > 5
 
-    return gin.H{
-        "name":            top,
-        "number":          num,
-        "clean_number":    num,
-        "is_spam":         isSpam,
-        "location":        "India",
-        "votes":           total,
-        "is_business":     data.IsBusiness,
-        "spam_reports":    data.SpamReports,
-        "status":          "success",
-        "all_suggestions": data.Names,
-    }
+	return gin.H{
+		"name":            top,
+		"number":          num,
+		"clean_number":    num,
+		"is_spam":         isSpam,
+		"location":        "India",
+		"votes":           total,
+		"is_business":     data.IsBusiness,
+		"spam_reports":    data.SpamReports,
+		"status":          "success",
+		"all_suggestions": data.Names,
+	}
 }
 
 // ================= GET =================
 func getCaller(c *gin.Context) {
-    num := normalizeNumber(c.Query("number"))
+	num := normalizeNumber(c.Query("number"))
 
-    if data, ok := getFromCache(num); ok {
-        c.JSON(200, buildResponse(num, data))
-        return
-    }
+	if data, ok := getFromCache(num); ok {
+		c.JSON(200, buildResponse(num, data))
+		return
+	}
 
-    data, ok := getFromDB(num)
-    if !ok {
-        c.JSON(200, gin.H{
-            "name":         "Unknown",
-            "number":       num,
-            "clean_number": num,
-            "status":       "not_found",
-        })
-        return
-    }
+	data, ok := getFromDB(num)
+	if !ok {
+		c.JSON(200, gin.H{
+			"name":         "Unknown",
+			"number":       num,
+			"clean_number": num,
+			"status":       "not_found",
+		})
+		return
+	}
 
-    setCache(num, data)
-    c.JSON(200, buildResponse(num, data))
+	setCache(num, data)
+	c.JSON(200, buildResponse(num, data))
 }
 
 // ================= SYNC =================
 func syncContacts(c *gin.Context) {
-    var req struct {
-        Contacts []struct {
-            Name   string `json:"name"`
-            Number string `json:"number"`
-        } `json:"contacts"`
-    }
+	var req struct {
+		Contacts []ContactInput `json:"contacts"`
+	}
 
-    if err := c.ShouldBindJSON(&req); err != nil {
-        log.Println("❌ JSON ERROR:", err)
-        c.JSON(400, gin.H{"status": "invalid"})
-        return
-    }
+	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Println("❌ JSON ERROR:", err)
+		c.JSON(400, gin.H{"status": "invalid"})
+		return
+	}
 
-    var wg sync.WaitGroup
-    var processed int64
+	var wg sync.WaitGroup
+	var processed int64
 
-    for _, ct := range req.Contacts {
-        workerPool <- struct{}{}
-        wg.Add(1)
+	for _, ct := range req.Contacts {
+		workerPool <- struct{}{}
+		wg.Add(1)
 
-        go func(cn struct {
-            Name   string
-            Number string
-        }) {
-            defer wg.Done()
-            defer func() { <-workerPool }()
+		go func(cn ContactInput) {
+			defer wg.Done()
+			defer func() { <-workerPool }()
 
-            num := normalizeNumber(cn.Number)
-            name := strings.TrimSpace(cn.Name)
+			num := normalizeNumber(cn.Number)
+			name := strings.TrimSpace(cn.Name)
 
-            if num == "" || name == "" {
-                return
-            }
+			if num == "" || name == "" {
+				return
+			}
 
-            if err := upsertContact(name, num, isBusinessName(name)); err != nil {
-                log.Println("❌ DB ERROR:", err)
-                return
-            }
+			if err := upsertContact(name, num, isBusinessName(name)); err != nil {
+				log.Println("❌ DB ERROR:", err)
+				return
+			}
 
-            data, _ := getFromDB(num)
-            setCache(num, data)
+			data, _ := getFromDB(num)
+			setCache(num, data)
 
-            atomic.AddInt64(&processed, 1)
-        }(ct)
-    }
+			atomic.AddInt64(&processed, 1)
+		}(ct)
+	}
 
-    wg.Wait()
+	wg.Wait()
 
-    c.JSON(200, gin.H{
-        "processed": processed,
-        "status":    "success",
-    })
+	c.JSON(200, gin.H{
+		"processed": processed,
+		"status":    "success",
+	})
 }
 
 // ================= SPAM =================
 func reportSpam(c *gin.Context) {
-    var req struct {
-        Number string `json:"number"`
-    }
+	var req struct {
+		Number string `json:"number"`
+	}
 
-    if err := c.ShouldBindJSON(&req); err != nil {
-        c.JSON(400, gin.H{"status": "invalid"})
-        return
-    }
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"status": "invalid"})
+		return
+	}
 
-    num := normalizeNumber(req.Number)
+	num := normalizeNumber(req.Number)
 
-    db.Exec(`UPDATE contacts SET spam_reports = spam_reports + 1 WHERE number=$1`, num)
+	db.Exec(`UPDATE contacts SET spam_reports = spam_reports + 1 WHERE number=$1`, num)
 
-    c.JSON(200, gin.H{"status": "reported"})
+	c.JSON(200, gin.H{"status": "reported"})
 }
 
 // ================= ADMIN =================
 func adminPage(c *gin.Context) {
-    c.File("./static/admin.html")
+	c.File("./static/admin.html")
 }
 
 func adminSearch(c *gin.Context) {
-    num := normalizeNumber(c.Query("number"))
+	num := normalizeNumber(c.Query("number"))
 
-    row := db.QueryRow("SELECT names, spam_reports, is_business FROM contacts WHERE number=$1", num)
+	row := db.QueryRow("SELECT names, spam_reports, is_business FROM contacts WHERE number=$1", num)
 
-    var namesJSON []byte
-    var spam int
-    var isBiz bool
+	var namesJSON []byte
+	var spam int
+	var isBiz bool
 
-    err := row.Scan(&namesJSON, &spam, &isBiz)
-    if err != nil {
-        c.JSON(200, gin.H{"status": "not_found"})
-        return
-    }
+	err := row.Scan(&namesJSON, &spam, &isBiz)
+	if err != nil {
+		c.JSON(200, gin.H{"status": "not_found"})
+		return
+	}
 
-    names := make(map[string]int)
-    json.Unmarshal(namesJSON, &names)
+	names := make(map[string]int)
+	json.Unmarshal(namesJSON, &names)
 
-    c.JSON(200, gin.H{
-        "number": num,
-        "names":  names,
-        "spam":   spam,
-        "isBiz":  isBiz,
-    })
+	c.JSON(200, gin.H{
+		"number": num,
+		"names":  names,
+		"spam":   spam,
+		"isBiz":  isBiz,
+	})
 }
 
 func adminUpload(c *gin.Context) {
-    file, err := c.FormFile("file")
-    if err != nil {
-        c.JSON(400, gin.H{"error": "file missing"})
-        return
-    }
+	file, err := c.FormFile("file")
+	if err != nil {
+		c.JSON(400, gin.H{"error": "file missing"})
+		return
+	}
 
-    path := "./admin/" + file.Filename
-    c.SaveUploadedFile(file, path)
+	path := "./admin/" + file.Filename
+	c.SaveUploadedFile(file, path)
 
-    data, _ := os.ReadFile(path)
+	data, _ := os.ReadFile(path)
 
-    var req struct {
-        Contacts []struct {
-            Name   string `json:"name"`
-            Number string `json:"number"`
-        } `json:"contacts"`
-    }
+	var req struct {
+		Contacts []ContactInput `json:"contacts"`
+	}
 
-    json.Unmarshal(data, &req)
+	json.Unmarshal(data, &req)
 
-    count := 0
+	count := 0
 
-    for _, ct := range req.Contacts {
-        num := normalizeNumber(ct.Number)
-        name := strings.TrimSpace(ct.Name)
+	for _, ct := range req.Contacts {
+		num := normalizeNumber(ct.Number)
+		name := strings.TrimSpace(ct.Name)
 
-        if num == "" || name == "" {
-            continue
-        }
+		if num == "" || name == "" {
+			continue
+		}
 
-        db.Exec(`
-        INSERT INTO contacts (number, names)
-        VALUES ($1, jsonb_build_object($2::text, 1))
-        ON CONFLICT (number)
-        DO UPDATE SET 
-            names = contacts.names || jsonb_build_object($2::text, COALESCE((contacts.names ->> $2)::int, 0) + 1)
-        `, num, name)
+		db.Exec(`
+		INSERT INTO contacts (number, names)
+		VALUES ($1, jsonb_build_object($2::text, 1))
+		ON CONFLICT (number)
+		DO UPDATE SET 
+		names = contacts.names || jsonb_build_object(
+			$2::text,
+			COALESCE((contacts.names ->> $2)::int, 0) + 1
+		)
+		`, num, name)
 
-        count++
-    }
+		count++
+	}
 
-    c.JSON(200, gin.H{"uploaded": count})
+	c.JSON(200, gin.H{"uploaded": count})
 }
 
 // ================= MAIN =================
 func main() {
-    initDB()
+	initDB()
+	initRedis()
 
-    r := gin.Default()
-    r.SetTrustedProxies(nil)
+	r := gin.Default()
+	r.SetTrustedProxies(nil)
 
-    // Public routes
-    r.GET("/get", getCaller)
+	// Public routes
+	r.GET("/get", getCaller)
 
-    // API routes
-    api := r.Group("/api")
-    api.Use(func(c *gin.Context) {
-        if c.GetHeader("X-API-Key") != "truecaller_pro_2026" {
-            c.JSON(401, gin.H{"error": "unauthorized"})
-            c.Abort()
-            return
-        }
-        c.Next()
-    })
-    api.POST("/sync", syncContacts)
-    api.POST("/report_spam", reportSpam)
+	// API routes
+	api := r.Group("/api")
+	api.Use(func(c *gin.Context) {
+		if c.GetHeader("X-API-Key") != "truecaller_pro_2026" {
+			c.JSON(401, gin.H{"error": "unauthorized"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	})
+	api.POST("/sync", syncContacts)
+	api.POST("/report_spam", reportSpam)
 
-    // Admin routes
-    r.GET("/admin", adminPage)
-    r.GET("/admin/search", adminSearch)
-    r.POST("/admin/upload", adminUpload)
+	// Admin routes
+	r.GET("/admin", adminPage)
+	r.GET("/admin/search", adminSearch)
+	r.POST("/admin/upload", adminUpload)
 
-    // Health check
-    r.GET("/health", func(c *gin.Context) {
-        c.String(200, "OK")
-    })
+	// Health check
+	r.GET("/health", func(c *gin.Context) {
+		c.String(200, "OK")
+	})
 
-    log.Println("🚀 Running at port", os.Getenv("PORT"))
-    port := os.Getenv("PORT")
-    if port == "" {
-        port = "5001"
-    }
-    r.Run(":" + port)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "5001"
+	}
+	log.Println("🚀 Running at port", port)
+	r.Run(":" + port)
 }
