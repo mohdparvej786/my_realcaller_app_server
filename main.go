@@ -40,7 +40,7 @@ func initDB() {
 		" user=" + os.Getenv("PGUSER") +
 		" password=" + os.Getenv("PGPASSWORD") +
 		" dbname=" + os.Getenv("PGDATABASE") +
-		" sslmode=disable"
+		" sslmode=" + os.Getenv("PGSSL") // use PGSSL env
 
 	var err error
 	db, err = sql.Open("pgx", connStr)
@@ -52,15 +52,7 @@ func initDB() {
 		log.Fatal("DB not connected:", err)
 	}
 
-	// Create table if not exists
-	db.Exec(`
-	CREATE TABLE IF NOT EXISTS contacts (
-		number TEXT PRIMARY KEY,
-		names JSONB,
-		spam_reports INT DEFAULT 0,
-		is_business BOOLEAN DEFAULT FALSE,
-		updated_at TIMESTAMP DEFAULT NOW()
-	);`)
+	log.Println("✅ Database connected")
 
 	// Redis init
 	rdb = redis.NewClient(&redis.Options{
@@ -71,6 +63,7 @@ func initDB() {
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
 		log.Fatal("Redis not connected:", err)
 	}
+	log.Println("✅ Redis connected")
 }
 
 // ================= HELPERS =================
