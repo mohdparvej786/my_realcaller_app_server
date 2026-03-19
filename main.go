@@ -8,7 +8,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -18,8 +17,10 @@ import (
 
 var db *sql.DB
 var rdb *redis.Client
-var workerPool = make(chan struct{}, 100)
 var ctx = context.Background()
+
+// 🚀 RAM Cache
+var localCache sync.Map
 
 // ================= STRUCT =================
 type Contact struct {
@@ -35,7 +36,7 @@ type ContactInput struct {
 
 // ================= INIT =================
 func initDB() {
-	connStr := os.Getenv("DATABASE_URL") // Render internal DB URL
+	connStr := os.Getenv("DATABASE_URL")
 
 	var err error
 	db, err = sql.Open("pgx", connStr)
@@ -43,11 +44,15 @@ func initDB() {
 		log.Fatal(err)
 	}
 
+	// 🚀 Pooling
+	db.SetMaxOpenConns(50)
+	db.SetMaxIdleConns(25)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
 	if err := db.Ping(); err != nil {
-		log.Fatal("DB not connected:", err)
+		log.Fatal("DB error:", err)
 	}
 
-	// Create table if not exists
 	db.Exec(`
 	CREATE TABLE IF NOT EXISTS contacts (
 		number TEXT PRIMARY KEY,
@@ -56,26 +61,26 @@ func initDB() {
 		is_business BOOLEAN DEFAULT FALSE,
 		updated_at TIMESTAMP DEFAULT NOW()
 	);`)
+
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_number ON contacts(number);`)
 }
 
 // ================= REDIS =================
 func initRedis() {
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
-		log.Println("⚠️ REDIS_URL not set, caching disabled")
+		log.Println("⚠️ Redis disabled")
 		return
 	}
 
 	opt, err := redis.ParseURL(redisURL)
 	if err != nil {
-		log.Println("⚠️ REDIS PARSE ERROR:", err)
 		return
 	}
 
 	rdb = redis.NewClient(opt)
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Println("⚠️ Redis not connected:", err)
-		rdb = nil // disable caching
+		rdb = nil
 		return
 	}
 
@@ -84,16 +89,17 @@ func initRedis() {
 
 // ================= HELPERS =================
 func normalizeNumber(number string) string {
-	digits := ""
+	var digits strings.Builder
 	for _, c := range number {
 		if c >= '0' && c <= '9' {
-			digits += string(c)
+			digits.WriteRune(c)
 		}
 	}
-	if len(digits) >= 10 {
-		return digits[len(digits)-10:]
+	num := digits.String()
+	if len(num) >= 10 {
+		return num[len(num)-10:]
 	}
-	return digits
+	return num
 }
 
 func isBusinessName(name string) bool {
@@ -108,11 +114,26 @@ func isBusinessName(name string) bool {
 }
 
 // ================= CACHE =================
-func getFromCache(number string) (Contact, bool) {
+
+// RAM
+func getLocal(num string) (Contact, bool) {
+	val, ok := localCache.Load(num)
+	if !ok {
+		return Contact{}, false
+	}
+	return val.(Contact), true
+}
+
+func setLocal(num string, data Contact) {
+	localCache.Store(num, data)
+}
+
+// Redis
+func getRedis(num string) (Contact, bool) {
 	if rdb == nil {
 		return Contact{}, false
 	}
-	val, err := rdb.Get(ctx, "c:"+number).Result()
+	val, err := rdb.Get(ctx, "c:"+num).Result()
 	if err != nil {
 		return Contact{}, false
 	}
@@ -121,21 +142,21 @@ func getFromCache(number string) (Contact, bool) {
 	return data, true
 }
 
-func setCache(number string, data Contact) {
+func setRedis(num string, data Contact) {
 	if rdb == nil {
 		return
 	}
 	j, _ := json.Marshal(data)
-	rdb.Set(ctx, "c:"+number, j, 10*time.Minute)
+	rdb.Set(ctx, "c:"+num, j, 1*time.Hour)
 }
 
 // ================= DB =================
-func getFromDB(number string) (Contact, bool) {
-	ctxDB, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+func getFromDB(num string) (Contact, bool) {
+	ctxDB, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	row := db.QueryRowContext(ctxDB,
-		"SELECT names, spam_reports, is_business FROM contacts WHERE number=$1", number)
+		"SELECT names, spam_reports, is_business FROM contacts WHERE number=$1", num)
 
 	var namesJSON []byte
 	var spam int
@@ -152,26 +173,27 @@ func getFromDB(number string) (Contact, bool) {
 	return Contact{names, spam, isBiz}, true
 }
 
-// ================= UPSERT =================
-func upsertContact(name, num string, isBiz bool) error {
-	ctxDB, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+// ================= SPAM LOGIC =================
+func isSpamAdvanced(data Contact) bool {
+	total := 0
+	max := 0
 
-	_, err := db.ExecContext(ctxDB, `
-	INSERT INTO contacts (number, names, is_business)
-	VALUES ($1, jsonb_build_object($2::text, 1), $3)
-	ON CONFLICT (number)
-	DO UPDATE SET 
-	names = contacts.names || 
-	        jsonb_build_object(
-	            $2::text, 
-	            COALESCE((contacts.names ->> $2)::int, 0) + 1
-	        ),
-	is_business = contacts.is_business OR $3,
-	updated_at = NOW()
-	`, num, name, isBiz)
+	for _, v := range data.Names {
+		total += v
+		if v > max {
+			max = v
+		}
+	}
 
-	return err
+	if data.SpamReports > 10 {
+		return true
+	}
+
+	if total > 20 && max < (total/2) {
+		return true
+	}
+
+	return false
 }
 
 // ================= RESPONSE =================
@@ -188,19 +210,14 @@ func buildResponse(num string, data Contact) gin.H {
 		}
 	}
 
-	isSpam := data.SpamReports > 5
-
 	return gin.H{
-		"name":            top,
-		"number":          num,
-		"clean_number":    num,
-		"is_spam":         isSpam,
-		"location":        "India",
-		"votes":           total,
-		"is_business":     data.IsBusiness,
-		"spam_reports":    data.SpamReports,
-		"status":          "success",
-		"all_suggestions": data.Names,
+		"name":         top,
+		"number":       num,
+		"is_spam":      isSpamAdvanced(data),
+		"votes":        total,
+		"is_business":  data.IsBusiness,
+		"spam_reports": data.SpamReports,
+		"status":       "success",
 	}
 }
 
@@ -208,74 +225,82 @@ func buildResponse(num string, data Contact) gin.H {
 func getCaller(c *gin.Context) {
 	num := normalizeNumber(c.Query("number"))
 
-	if data, ok := getFromCache(num); ok {
+	// 1. RAM
+	if data, ok := getLocal(num); ok {
 		c.JSON(200, buildResponse(num, data))
 		return
 	}
 
+	// 2. Redis
+	if data, ok := getRedis(num); ok {
+		setLocal(num, data)
+		c.JSON(200, buildResponse(num, data))
+		return
+	}
+
+	// 3. DB
 	data, ok := getFromDB(num)
 	if !ok {
+		empty := Contact{}
+		setLocal(num, empty)
+		setRedis(num, empty)
+
 		c.JSON(200, gin.H{
-			"name":         "Unknown",
-			"number":       num,
-			"clean_number": num,
-			"status":       "not_found",
+			"name":   "Unknown",
+			"number": num,
+			"status": "not_found",
 		})
 		return
 	}
 
-	setCache(num, data)
+	setLocal(num, data)
+	setRedis(num, data)
+
 	c.JSON(200, buildResponse(num, data))
 }
 
-// ================= SYNC =================
-func syncContacts(c *gin.Context) {
+// ================= FAST SYNC =================
+func syncContactsFast(c *gin.Context) {
 	var req struct {
 		Contacts []ContactInput `json:"contacts"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		log.Println("❌ JSON ERROR:", err)
 		c.JSON(400, gin.H{"status": "invalid"})
 		return
 	}
 
-	var wg sync.WaitGroup
-	var processed int64
+	tx, _ := db.Begin()
+	stmt, _ := tx.Prepare(`
+	INSERT INTO contacts (number, names, is_business)
+	VALUES ($1, jsonb_build_object($2::text, 1), $3)
+	ON CONFLICT (number)
+	DO UPDATE SET 
+	names = contacts.names || jsonb_build_object(
+		$2::text,
+		COALESCE((contacts.names ->> $2)::int, 0) + 1
+	),
+	is_business = contacts.is_business OR $3
+	`)
+
+	count := 0
 
 	for _, ct := range req.Contacts {
-		workerPool <- struct{}{}
-		wg.Add(1)
+		num := normalizeNumber(ct.Number)
+		name := strings.TrimSpace(ct.Name)
 
-		go func(cn ContactInput) {
-			defer wg.Done()
-			defer func() { <-workerPool }()
+		if num == "" || name == "" {
+			continue
+		}
 
-			num := normalizeNumber(cn.Number)
-			name := strings.TrimSpace(cn.Name)
-
-			if num == "" || name == "" {
-				return
-			}
-
-			if err := upsertContact(name, num, isBusinessName(name)); err != nil {
-				log.Println("❌ DB ERROR:", err)
-				return
-			}
-
-			data, _ := getFromDB(num)
-			setCache(num, data)
-
-			atomic.AddInt64(&processed, 1)
-		}(ct)
+		stmt.Exec(num, name, isBusinessName(name))
+		count++
 	}
 
-	wg.Wait()
+	stmt.Close()
+	tx.Commit()
 
-	c.JSON(200, gin.H{
-		"processed": processed,
-		"status":    "success",
-	})
+	c.JSON(200, gin.H{"processed": count})
 }
 
 // ================= SPAM =================
@@ -296,94 +321,15 @@ func reportSpam(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "reported"})
 }
 
-// ================= ADMIN =================
-func adminPage(c *gin.Context) {
-	c.File("./static/admin.html")
-}
-
-func adminSearch(c *gin.Context) {
-	num := normalizeNumber(c.Query("number"))
-
-	row := db.QueryRow("SELECT names, spam_reports, is_business FROM contacts WHERE number=$1", num)
-
-	var namesJSON []byte
-	var spam int
-	var isBiz bool
-
-	err := row.Scan(&namesJSON, &spam, &isBiz)
-	if err != nil {
-		c.JSON(200, gin.H{"status": "not_found"})
-		return
-	}
-
-	names := make(map[string]int)
-	json.Unmarshal(namesJSON, &names)
-
-	c.JSON(200, gin.H{
-		"number": num,
-		"names":  names,
-		"spam":   spam,
-		"isBiz":  isBiz,
-	})
-}
-
-func adminUpload(c *gin.Context) {
-	file, err := c.FormFile("file")
-	if err != nil {
-		c.JSON(400, gin.H{"error": "file missing"})
-		return
-	}
-
-	path := "./admin/" + file.Filename
-	c.SaveUploadedFile(file, path)
-
-	data, _ := os.ReadFile(path)
-
-	var req struct {
-		Contacts []ContactInput `json:"contacts"`
-	}
-
-	json.Unmarshal(data, &req)
-
-	count := 0
-
-	for _, ct := range req.Contacts {
-		num := normalizeNumber(ct.Number)
-		name := strings.TrimSpace(ct.Name)
-
-		if num == "" || name == "" {
-			continue
-		}
-
-		db.Exec(`
-		INSERT INTO contacts (number, names)
-		VALUES ($1, jsonb_build_object($2::text, 1))
-		ON CONFLICT (number)
-		DO UPDATE SET 
-		names = contacts.names || jsonb_build_object(
-			$2::text,
-			COALESCE((contacts.names ->> $2)::int, 0) + 1
-		)
-		`, num, name)
-
-		count++
-	}
-
-	c.JSON(200, gin.H{"uploaded": count})
-}
-
 // ================= MAIN =================
 func main() {
 	initDB()
 	initRedis()
 
 	r := gin.Default()
-	r.SetTrustedProxies(nil)
 
-	// Public routes
 	r.GET("/get", getCaller)
 
-	// API routes
 	api := r.Group("/api")
 	api.Use(func(c *gin.Context) {
 		if c.GetHeader("X-API-Key") != "truecaller_pro_2026" {
@@ -393,15 +339,10 @@ func main() {
 		}
 		c.Next()
 	})
-	api.POST("/sync", syncContacts)
+
+	api.POST("/sync", syncContactsFast)
 	api.POST("/report_spam", reportSpam)
 
-	// Admin routes
-	r.GET("/admin", adminPage)
-	r.GET("/admin/search", adminSearch)
-	r.POST("/admin/upload", adminUpload)
-
-	// Health check
 	r.GET("/health", func(c *gin.Context) {
 		c.String(200, "OK")
 	})
@@ -410,6 +351,7 @@ func main() {
 	if port == "" {
 		port = "5001"
 	}
-	log.Println("🚀 Running at port", port)
+
+	log.Println("🚀 Production Server Running:", port)
 	r.Run(":" + port)
 }
